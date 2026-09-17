@@ -46,11 +46,14 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -113,19 +116,63 @@ public:
         return written;
     }
 
+    // Input-rate samples still held, i.e. latency sitting in the resampler.
+    std::size_t Pending() const {
+        const std::size_t consumed = static_cast<std::size_t>(pos_);
+        return buffer_.size() > consumed ? buffer_.size() - consumed : 0;
+    }
+
 private:
     double ratio_;
     double pos_ = 0.0;
     std::vector<float> buffer_;
 };
 
+// Lock-free min/max for the audio callbacks; contention is nil in practice.
+void AtomicMax(std::atomic<std::uint64_t> &target, std::uint64_t value) {
+    std::uint64_t prev = target.load(std::memory_order_relaxed);
+    while (value > prev && !target.compare_exchange_weak(prev, value, std::memory_order_relaxed)) {
+    }
+}
+
+void AtomicMin(std::atomic<std::uint64_t> &target, std::uint64_t value) {
+    std::uint64_t prev = target.load(std::memory_order_relaxed);
+    while (value < prev && !target.compare_exchange_weak(prev, value, std::memory_order_relaxed)) {
+    }
+}
+
+constexpr std::uint64_t kNoMin = std::numeric_limits<std::uint64_t>::max();
+
 // Counters updated from the (real-time) audio callbacks. Only cheap atomic
-// increments happen on the audio thread; all printing happens elsewhere.
+// stores, increments and one clock read per callback happen on the audio
+// thread; all printing happens elsewhere. Fields marked "per interval" are
+// reset by the printer, so each line describes the second it covers rather
+// than the whole run.
 struct Stats {
     std::atomic<std::uint64_t> input_underflows{0};
     std::atomic<std::uint64_t> input_overflows{0};
     std::atomic<std::uint64_t> output_underflows{0};
     std::atomic<std::uint64_t> output_overflows{0};
+
+    // Where audio is queued up right now, in samples. Every one of these is
+    // latency between the mic and the speaker, and none of it is included in
+    // PortAudio's own per-stream latency numbers.
+    std::atomic<std::uint64_t> resampler_pending{0}; // input-rate samples awaiting resampling
+    std::atomic<std::uint64_t> nam_pending{0};       // 48k samples awaiting a full model block
+
+    // Buffer sizes PortAudio actually chose, in frames.
+    std::atomic<std::uint64_t> input_frames{0};
+    std::atomic<std::uint64_t> output_frames{0};
+
+    // Per interval: how far the bridging FIFO swung, seen by the output side.
+    std::atomic<std::uint64_t> fifo_min{kNoMin};
+    std::atomic<std::uint64_t> fifo_max{0};
+
+    // Per interval: what the model cost and what we failed to deliver.
+    std::atomic<std::uint64_t> dsp_ns_total{0};
+    std::atomic<std::uint64_t> dsp_ns_worst_callback{0};
+    std::atomic<std::uint64_t> dsp_blocks{0};
+    std::atomic<std::uint64_t> starved_samples{0};
 };
 
 struct InputCallbackData {
@@ -167,12 +214,24 @@ int InputCallback(const void *input_buffer, void *, unsigned long frame_count,
     data->nam_in_fifo.insert(data->nam_in_fifo.end(), resampled.begin(), resampled.begin() + static_cast<long>(got));
 
     std::array<float, NamAudio::kBlockSize> chunk{}, left{}, right{};
+    const auto dsp_start = std::chrono::steady_clock::now();
+    std::uint64_t blocks = 0;
     while (data->nam_in_fifo.size() >= NamAudio::kBlockSize) {
         std::copy(data->nam_in_fifo.begin(), data->nam_in_fifo.begin() + NamAudio::kBlockSize, chunk.begin());
         data->nam_in_fifo.erase(data->nam_in_fifo.begin(), data->nam_in_fifo.begin() + NamAudio::kBlockSize);
         data->audio->Process(chunk.data(), left.data(), right.data(), NamAudio::kBlockSize, /*bypass_model=*/false);
         data->output_fifo->Push(left.data(), NamAudio::kBlockSize);
+        ++blocks;
     }
+    const auto dsp_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - dsp_start).count());
+
+    data->stats->input_frames.store(n, std::memory_order_relaxed);
+    data->stats->resampler_pending.store(data->to_48k.Pending(), std::memory_order_relaxed);
+    data->stats->nam_pending.store(data->nam_in_fifo.size(), std::memory_order_relaxed);
+    data->stats->dsp_ns_total.fetch_add(dsp_ns, std::memory_order_relaxed);
+    data->stats->dsp_blocks.fetch_add(blocks, std::memory_order_relaxed);
+    AtomicMax(data->stats->dsp_ns_worst_callback, dsp_ns);
     return paContinue;
 }
 
@@ -188,7 +247,14 @@ int OutputCallback(const void *, void *output_buffer, unsigned long frame_count,
     const std::size_t n = frame_count;
 
     std::vector<float> mono_out(n, 0.0f);
-    data->output_fifo->Pop(mono_out.data(), n);
+    const std::size_t got = data->output_fifo->Pop(mono_out.data(), n);
+    if (got < n) // ran dry: the rest of this buffer goes out as silence
+        data->stats->starved_samples.fetch_add(n - got, std::memory_order_relaxed);
+
+    const std::uint64_t fifo_after = data->output_fifo->Size();
+    data->stats->output_frames.store(n, std::memory_order_relaxed);
+    AtomicMin(data->stats->fifo_min, fifo_after);
+    AtomicMax(data->stats->fifo_max, fifo_after);
 
     const std::size_t out_channels = static_cast<std::size_t>(data->channels);
     for (std::size_t i = 0; i < n; ++i) {
@@ -198,32 +264,99 @@ int OutputCallback(const void *, void *output_buffer, unsigned long frame_count,
     return paContinue;
 }
 
-void PrintStatsLoop(PaStream *input_stream, PaStream *output_stream, SharedFifo *output_fifo,
-                     Stats *stats, std::atomic<bool> *keep_running) {
+struct StatsView {
+    PaStream *input_stream;
+    PaStream *output_stream;
+    SharedFifo *output_fifo;
+    Stats *stats;
+    double in_rate;
+    double out_rate;
+};
+
+// Milliseconds a count of samples represents at a given rate.
+double Ms(double samples, double rate) { return samples / rate * 1000.0; }
+
+void PrintStatsLoop(StatsView view, std::atomic<bool> *keep_running) {
+    Stats *stats = view.stats;
+    const auto started = std::chrono::steady_clock::now();
+
     while (keep_running->load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         if (!keep_running->load(std::memory_order_relaxed))
             break;
 
-        const PaStreamInfo *in_info = Pa_GetStreamInfo(input_stream);
-        const PaStreamInfo *out_info = Pa_GetStreamInfo(output_stream);
-        const double in_latency_ms = in_info ? in_info->inputLatency * 1000.0 : -1.0;
-        const double out_latency_ms = out_info ? out_info->outputLatency * 1000.0 : -1.0;
-        const double in_cpu = Pa_GetStreamCpuLoad(input_stream) * 100.0;
-        const double out_cpu = Pa_GetStreamCpuLoad(output_stream) * 100.0;
-        const std::size_t fifo_samples = output_fifo->Size();
-        const double fifo_ms = fifo_samples / static_cast<double>(NamAudio::kSampleRate) * 1000.0;
-        const double estimated_round_trip_ms = in_latency_ms + out_latency_ms + fifo_ms;
+        const double elapsed_s =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 
-        std::cout << std::fixed << std::setprecision(1)
-                  << "[stats] EST. ROUND TRIP=" << estimated_round_trip_ms << "ms"
-                  << " (device in=" << in_latency_ms << "ms + device out=" << out_latency_ms
-                  << "ms + our fifo=" << fifo_ms << "ms)"
-                  << " | cpu in=" << in_cpu << "% out=" << out_cpu << "%"
-                  << " | fifo=" << fifo_samples << " samples"
-                  << " | underflow in=" << stats->input_underflows.load() << " out=" << stats->output_underflows.load()
-                  << " | overflow in=" << stats->input_overflows.load() << " out=" << stats->output_overflows.load()
-                  << std::endl;
+        // Fold the depth we are about to print into the interval's range, so
+        // "now" always sits inside the min..max the same line reports.
+        const std::size_t fifo_now = view.output_fifo->Size();
+        AtomicMin(stats->fifo_min, fifo_now);
+        AtomicMax(stats->fifo_max, fifo_now);
+
+        // Take and reset the per-interval accumulators in one go, so the line
+        // describes the second just ended.
+        const std::uint64_t fifo_min_raw = stats->fifo_min.exchange(kNoMin, std::memory_order_relaxed);
+        const std::uint64_t fifo_max = stats->fifo_max.exchange(0, std::memory_order_relaxed);
+        const std::uint64_t dsp_ns_total = stats->dsp_ns_total.exchange(0, std::memory_order_relaxed);
+        const std::uint64_t dsp_worst_ns = stats->dsp_ns_worst_callback.exchange(0, std::memory_order_relaxed);
+        const std::uint64_t dsp_blocks = stats->dsp_blocks.exchange(0, std::memory_order_relaxed);
+        const std::uint64_t starved = stats->starved_samples.exchange(0, std::memory_order_relaxed);
+        const std::uint64_t fifo_min = fifo_min_raw == kNoMin ? 0 : fifo_min_raw;
+
+        const PaStreamInfo *in_info = Pa_GetStreamInfo(view.input_stream);
+        const PaStreamInfo *out_info = Pa_GetStreamInfo(view.output_stream);
+        const double device_in_ms = in_info ? in_info->inputLatency * 1000.0 : 0.0;
+        const double device_out_ms = out_info ? out_info->outputLatency * 1000.0 : 0.0;
+
+        const std::uint64_t resampler_smp = stats->resampler_pending.load(std::memory_order_relaxed);
+        const std::uint64_t nam_smp = stats->nam_pending.load(std::memory_order_relaxed);
+        const std::uint64_t in_frames = stats->input_frames.load(std::memory_order_relaxed);
+        const std::uint64_t out_frames = stats->output_frames.load(std::memory_order_relaxed);
+
+        const double resampler_ms = Ms(static_cast<double>(resampler_smp), view.in_rate);
+        const double nam_ms = Ms(static_cast<double>(nam_smp), NamAudio::kSampleRate);
+        const double fifo_now_ms = Ms(static_cast<double>(fifo_now), NamAudio::kSampleRate);
+        const double fifo_min_ms = Ms(static_cast<double>(fifo_min), NamAudio::kSampleRate);
+        const double fifo_max_ms = Ms(static_cast<double>(fifo_max), NamAudio::kSampleRate);
+        // Everything between the mic and the speaker. The device figures come
+        // from PortAudio; the middle three are ours and are invisible to it.
+        const double round_trip_ms = device_in_ms + resampler_ms + nam_ms + fifo_now_ms + device_out_ms;
+
+        // A callback must finish before the next buffer is due; that deadline
+        // is what the model's cost has to fit inside.
+        const double in_budget_ms = in_frames > 0 ? Ms(static_cast<double>(in_frames), view.in_rate) : 0.0;
+        const double dsp_avg_ms = dsp_blocks > 0 ? static_cast<double>(dsp_ns_total) / dsp_blocks / 1e6 : 0.0;
+        const double dsp_worst_ms = static_cast<double>(dsp_worst_ns) / 1e6;
+        const double dsp_headroom = in_budget_ms > 0.0 ? dsp_worst_ms / in_budget_ms * 100.0 : 0.0;
+
+        std::ostringstream line;
+        line << std::fixed << std::setprecision(1);
+        line << "[stats " << std::setprecision(0) << elapsed_s << "s] " << std::setprecision(1)
+             << "ROUND TRIP " << round_trip_ms << " ms mic to speaker\n";
+        line << "  1 mic in     device buffer " << device_in_ms << " ms"
+             << "  (" << in_frames << " frames per callback, cpu "
+             << Pa_GetStreamCpuLoad(view.input_stream) * 100.0 << "%)\n";
+        line << "  2 resampler  " << resampler_ms << " ms held"
+             << "  (" << resampler_smp << " samples at " << std::setprecision(0) << view.in_rate
+             << std::setprecision(1) << " Hz)\n";
+        line << "  3 block fill " << nam_ms << " ms held"
+             << "  (" << nam_smp << " of " << NamAudio::kBlockSize << " samples toward the next model block)\n";
+        line << "  4 model      " << std::setprecision(3) << dsp_avg_ms << " ms per block avg, "
+             << dsp_worst_ms << " ms worst callback" << std::setprecision(1)
+             << "  (" << dsp_headroom << "% of the " << in_budget_ms << " ms deadline, "
+             << dsp_blocks << " blocks/s)\n";
+        line << "  5 fifo       " << fifo_now_ms << " ms now, swung " << fifo_min_ms << " to " << fifo_max_ms
+             << " ms  (" << fifo_now << " samples, jitter " << (fifo_max_ms - fifo_min_ms) << " ms)\n";
+        line << "  6 speaker    device buffer " << device_out_ms << " ms"
+             << "  (" << out_frames << " frames per callback, cpu "
+             << Pa_GetStreamCpuLoad(view.output_stream) * 100.0 << "%)\n";
+        line << "  glitches     underflow in=" << stats->input_underflows.load(std::memory_order_relaxed)
+             << " out=" << stats->output_underflows.load(std::memory_order_relaxed)
+             << " | overflow in=" << stats->input_overflows.load(std::memory_order_relaxed)
+             << " out=" << stats->output_overflows.load(std::memory_order_relaxed)
+             << " | silence filled " << starved << " samples this second\n";
+        std::cout << line.str() << std::flush;
     }
 }
 
@@ -327,7 +460,8 @@ int main(int argc, char **argv) {
     Pa_StartStream(output_stream);
 
     std::atomic<bool> keep_running{true};
-    std::thread stats_thread(PrintStatsLoop, input_stream, output_stream, &output_fifo, &stats, &keep_running);
+    StatsView stats_view{input_stream, output_stream, &output_fifo, &stats, in_rate, out_rate};
+    std::thread stats_thread(PrintStatsLoop, stats_view, &keep_running);
 
     std::cout << "Running " << AmpName(static_cast<AmpId>(amp_id)) << " live. Press Enter to stop.\n";
     std::cin.get();

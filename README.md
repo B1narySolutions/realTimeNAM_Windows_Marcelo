@@ -256,8 +256,9 @@ own device indices from step 6.
 Windows may prompt for microphone permission the first time — allow it.
 Press **Enter** in the terminal to stop. To change amps, stop it and
 re-run with a different `amp_id` (switching live isn't supported yet).
-Every second while running, it prints a stats line — see
-[Reading the stats output](#reading-the-stats-output) below.
+Every second while running, it prints a breakdown of where the latency
+is coming from — see [Reading the stats output](#reading-the-stats-output)
+below.
 
 ### Plugging in a real guitar
 
@@ -297,27 +298,57 @@ works with whatever rate each device reports.
 
 ### Reading the stats output
 
-Every second, `live_mic.exe` prints a line like:
+Every second, `live_mic` prints the whole signal path, in order, with the
+delay each stage is holding:
 
 ```
-[stats] EST. ROUND TRIP=54.0ms (device in=22.0ms + device out=22.0ms + our fifo=10.0ms) | cpu in=14.4% out=0.1% | fifo=480 samples | underflow in=0 out=0 | overflow in=0 out=0
+[stats 12s] ROUND TRIP 64.1 ms mic to speaker
+  1 mic in     device buffer 32.8 ms  (63 frames per callback, cpu 1.7%)
+  2 resampler  0.0 ms held  (1 samples at 48000 Hz)
+  3 block fill 0.7 ms held  (32 of 48 samples toward the next model block)
+  4 model      0.018 ms per block avg, 0.061 ms worst callback  (4.6% of the 1.3 ms deadline, 1006 blocks/s)
+  5 fifo       12.7 ms now, swung 10.7 to 12.7 ms  (608 samples, jitter 2.0 ms)
+  6 speaker    device buffer 18.0 ms  (64 frames per callback, cpu 0.1%)
+  glitches     underflow in=0 out=0 | overflow in=0 out=0 | silence filled 0 samples this second
 ```
 
-- **EST. ROUND TRIP**: the honest total delay estimate — device-reported
-  latency for input and output, PLUS the extra delay sitting in the FIFO
-  bridging the two streams. The device-reported numbers alone
-  *understate* the real, audible delay; always look at this combined
-  figure, not just the two device numbers.
-- **cpu in/out**: how close each stream's callback is to running out of
-  time before the next one is due. Should stay low; climbing toward 100%
-  means dropouts are close.
-- **fifo=N samples**: how much audio is currently buffered between the
-  input and output streams. A **stable** number here (even if
-  moderately large) generally sounds and plays better than a **small
-  but constantly swinging** number — jittery, unpredictable delay is
-  harder to play against than a bigger but steady one.
-- **underflow/overflow**: real glitch counts. Anything above 0 means an
-  audible click or gap happened, even if not consciously noticed.
+**ROUND TRIP** is stages 1, 2, 3, 5 and 6 added up — the honest end-to-end
+figure. Stages 2, 3 and 5 are ours and are invisible to PortAudio's own
+latency numbers, so the two device figures alone *understate* what you
+hear. Stage 4 is not added in: the model runs inside the input callback,
+so its cost shows up as pressure on that callback's deadline rather than
+as extra queued audio.
+
+Read it top to bottom to see where the delay actually lives:
+
+- **1 mic in / 6 speaker** — each device's own buffering, as PortAudio
+  reports it. On typical laptop hardware these two dominate everything
+  else combined, and no amount of code tuning moves them; only a
+  different device or a lower-latency driver mode will.
+- **2 resampler** — input-rate samples held to bridge the input device's
+  rate up to the model's 48 kHz. Near zero when the input already runs
+  at 48 kHz; it never holds more than a sample or two.
+- **3 block fill** — samples waiting to complete the model's next
+  48-sample (1 ms) block. Bounded by one block, so this is always under
+  1 ms.
+- **4 model** — what the amp model costs, per block and for the worst
+  single callback in the last second, against the deadline that callback
+  had to meet. The percentage is the one to watch: low means the model
+  is nowhere near being the problem, and climbing toward 100% means
+  dropouts are imminent. On an M-series Mac this sits in the low single
+  digits.
+- **5 fifo** — audio queued between the two independent streams. The
+  swing matters more than the size: a **stable** number, even a
+  moderately large one, plays better than a **small but jittery** one,
+  because unpredictable delay is harder to play against than a bigger
+  steady one. A jitter figure that keeps growing means the two devices'
+  clocks are drifting apart faster than the FIFO can absorb.
+- **glitches** — underflow/overflow are PortAudio's own counts;
+  "silence filled" is how many samples the output stream wanted that the
+  FIFO could not supply, and went out as silence instead. Any of these
+  above 0 is an audible click or gap, whether or not you noticed it.
+  They are cumulative except "silence filled", which covers the last
+  second only, as do the model and FIFO swing figures.
 
 ### Known limitations
 
