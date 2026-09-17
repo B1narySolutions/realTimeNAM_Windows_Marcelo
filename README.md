@@ -206,9 +206,11 @@ g++ -std=c++17 tools/list_devices.cpp -lportaudio -o list_devices.exe
 
 This lists every device, tagged with which Windows audio API exposes it
 (MME, DirectSound, WASAPI, WDM-KS). Each physical device appears once per
-API — **use the `Windows WASAPI` entries**, the modern, lowest-latency
-option. Note the index numbers for your input device (mic/headset) and
-output device (speakers/headphones).
+API — **use the `Windows WASAPI` entries**. Note the index numbers for
+your input device (mic/headset/interface) and output device
+(speakers/headphones). **Re-run this right before every use** — indices
+reliably shift whenever a device is plugged, unplugged, or Windows
+re-enumerates it, even without you changing anything.
 
 **7. Build `live_mic`:**
 
@@ -236,16 +238,91 @@ own device indices from step 6.
 Windows may prompt for microphone permission the first time — allow it.
 Press **Enter** in the terminal to stop. To change amps, stop it and
 re-run with a different `amp_id` (switching live isn't supported yet).
+Every second while running, it prints a stats line — see
+[Reading the stats output](#reading-the-stats-output) below.
+
+### Plugging in a real guitar
+
+A laptop's mic/headphone jack is built for mic-level signals, not a
+guitar pickup's higher-impedance, lower-level output — plugging a guitar
+straight in will sound thin and weak. For a real guitar signal, use a
+**USB audio interface with a Hi-Z instrument input** (e.g. a PreSonus
+AudioBox, Focusrite Scarlett Solo, etc.) — it has the buffering/impedance
+matching a guitar pickup actually needs built into the hardware.
+
+1. **Install the interface's own driver software** if it has one (e.g.
+   PreSonus **Universal Control**) — don't rely on Windows' generic
+   driver, which can misreport or restrict the device's real
+   capabilities. Restart after installing.
+2. Plug your guitar into **Input 1** specifically — `live_mic.cpp`
+   currently only reads the first input channel. Flip that input's
+   **Mic/Line/Inst switch to Inst** — this is what activates the
+   high-impedance buffering; leaving it on Mic will sound weak or wrong.
+3. Turn up **Input 1's gain knob** — at zero you'll get silence
+   regardless of anything else being right.
+4. Run `list_devices.exe` with the interface plugged in and look for its
+   name (e.g. `Line (... AudioBox USB)`) under the `Windows WASAPI`
+   section — that's your input index.
+
+**Mismatched sample rates between devices:** some interfaces (particularly
+older/basic ones, like the original PreSonus AudioBox USB) are hard-locked
+to 44100 Hz and cannot be switched to 48000 Hz, even though the NAM model
+requires 48000 Hz internally, and your speakers/headphones might be
+separately locked to 48000 Hz with no 44100 Hz option. `live_mic.cpp`
+handles this automatically: it opens the input and output as two
+independent streams, each at its own device's native rate (read
+automatically via `defaultSampleRate` — you don't need to configure
+this), with a small internal resampler bridging the input side up to
+48000 Hz before the amp model, and a thread-safe FIFO buffer connecting
+the two streams. No code changes are needed for this case — it just
+works with whatever rate each device reports.
+
+### Reading the stats output
+
+Every second, `live_mic.exe` prints a line like:
+
+```
+[stats] EST. ROUND TRIP=54.0ms (device in=22.0ms + device out=22.0ms + our fifo=10.0ms) | cpu in=14.4% out=0.1% | fifo=480 samples | underflow in=0 out=0 | overflow in=0 out=0
+```
+
+- **EST. ROUND TRIP**: the honest total delay estimate — device-reported
+  latency for input and output, PLUS the extra delay sitting in the FIFO
+  bridging the two streams. The device-reported numbers alone
+  *understate* the real, audible delay; always look at this combined
+  figure, not just the two device numbers.
+- **cpu in/out**: how close each stream's callback is to running out of
+  time before the next one is due. Should stay low; climbing toward 100%
+  means dropouts are close.
+- **fifo=N samples**: how much audio is currently buffered between the
+  input and output streams. A **stable** number here (even if
+  moderately large) generally sounds and plays better than a **small
+  but constantly swinging** number — jittery, unpredictable delay is
+  harder to play against than a bigger but steady one.
+- **underflow/overflow**: real glitch counts. Anything above 0 means an
+  audible click or gap happened, even if not consciously noticed.
 
 ### Known limitations
 
-- **Latency**: this goes through Windows' shared audio stack, not a
-  low-latency ASIO path, so expect a noticeable delay (tens of
-  milliseconds) — fine for testing tone, not tuned for comfortable
-  real-time playing yet.
+- **Latency is dominated by using two separate physical devices for
+  input and output** (e.g. a USB interface for guitar in, laptop
+  speakers for output). Each device has its own independent clock, so a
+  software FIFO has to absorb the drift between them — this is a real,
+  measured source of both delay and jitter (tens of ms round trip is
+  typical), not just a tuning issue. **The single biggest latency win
+  available is routing both input and output through the same physical
+  device** (e.g. an interface's own headphone output) — this lets the
+  code use one unified duplex stream instead of two independent ones
+  bridged by a FIFO, removing the cross-device drift entirely.
+- Windows' shared audio mode (the default) has a further ~10-20ms floor
+  per direction on top of that. WASAPI exclusive mode can reduce the
+  *reported* number, but in testing on at least one device it produced
+  worse, jitterier real-world results than shared mode despite the lower
+  number — trust your ears and the stats' `fifo=` stability over the
+  raw device-latency figures alone.
 - **Signal quality depends on your input.** A built-in laptop mic or a
   headset mic picking up sound acoustically will sound noticeably worse
-  than a real instrument-level input, due to background noise and the
-  mic's own frequency response.
+  than a real instrument-level input through a proper Hi-Z interface
+  input, due to background noise and the mic's own frequency response.
+- **These are amp-only models.** No cabinet simulation is applied.
 - **No live amp-switching** in `live_mic` yet — stop and restart with a
   different `amp_id` to change amps.
