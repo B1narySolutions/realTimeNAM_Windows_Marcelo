@@ -58,6 +58,8 @@ Exit the monitor with **Ctrl-A**, then **K**, then **Y**.
 | `make clean` | Remove build outputs; keep downloaded models and dependencies. |
 | `make format` | Format C/C++ source in `src/` and `tests/`. |
 | `make compiledb` | Generate the clangd compilation database. |
+| `make list-devices` | Build and run `list_devices` to look up audio device indices. |
+| `make live-mic IN=<in> OUT=<out> [AMP=1]` | Build and run live mic mode in one command. |
 | `make help` | List commands. |
 
 Formatting and clangd setup require `brew install clang-format compiledb`.
@@ -213,7 +215,22 @@ your input device (mic/headset/interface) and output device
 reliably shift whenever a device is plugged, unplugged, or Windows
 re-enumerates it, even without you changing anything.
 
-**7. Build `live_mic`:**
+**7. Build and run `live_mic` in one command:**
+
+```sh
+make live-mic IN=15 OUT=13 AMP=1
+```
+
+`IN`/`OUT` are the device indices from step 6, `AMP` is `1`=Fender,
+`2`=Vox, `3`=Marshall (defaults to `1`). The target builds the binary to
+`build/tools/live_mic` with the host compiler (`$(CXX)`), generating the
+embedded model header first, and then runs it. Step 6's lister has a
+target too: `make list-devices`. PortAudio's compiler flags come from
+`pkg-config`, falling back to the Homebrew prefix and then to plain
+`-lportaudio`; override them with `PA_CFLAGS=` / `PA_LIBS=` if your
+install lives elsewhere. Skip to step 8 for how to read the arguments.
+
+The equivalent manual build:
 
 ```sh
 g++ -std=c++17 -O2 -Ibuild/generated -Isrc \

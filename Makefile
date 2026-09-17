@@ -2,7 +2,7 @@
 JOBS ?= 4
 include make/models.mk
 
-.PHONY: install build model upload program-dfu monitor format compiledb test clean help
+.PHONY: install build model upload program-dfu monitor format compiledb test live-mic list-devices check-devices clean help
 install:
 	bash scripts/install.sh
 	@if ls $(A2_MODELS) >/dev/null 2>&1; then \
@@ -58,4 +58,57 @@ help:
 	@echo 'make monitor  Open USB serial in screen (optional PORT=/dev/cu.usbmodem...).'
 	@echo 'make format   Format C/C++ files under src/ using .clang-format.'
 	@echo 'make compiledb Generate compile_commands.json for clangd without building.'
+	@echo 'make list-devices  Build and run the audio device lister to find IN/OUT indices.'
+	@echo 'make live-mic IN=<in> OUT=<out> [AMP=1]  Build and run live mic mode.'
 	@echo 'make clean    Remove firmware and libDaisy build outputs.'
+
+# Host tools: live mic monitoring through an amp model (needs PortAudio).
+NAM_DIR = libs/NeuralAmpModelerCore
+UNAME_S := $(shell uname -s)
+ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(UNAME_S)))
+EXE = .exe
+endif
+
+HOST_FLAGS = -std=c++17 -O2 -DNAM_SAMPLE_FLOAT -DNAM_USE_INLINE_GEMM
+HOST_INCLUDES = -Ibuild/generated -Isrc -I$(NAM_DIR) -I$(NAM_DIR)/NAM \
+  -I$(NAM_DIR)/Dependencies/eigen -I$(NAM_DIR)/Dependencies/nlohmann
+LIVE_MIC_SRC = tools/live_mic.cpp src/audio/nam_audio.cpp src/models/amp_models.cpp \
+  src/models/a2_lite.cpp src/audio/nam_processor.cpp $(NAM_DIR)/NAM/dsp.cpp
+
+# PortAudio flags: pkg-config if available, else Homebrew prefix, else plain -lportaudio.
+BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
+PA_CFLAGS ?= $(shell pkg-config --cflags portaudio-2.0 2>/dev/null)
+PA_LIBS ?= $(shell pkg-config --libs portaudio-2.0 2>/dev/null)
+ifeq ($(strip $(PA_LIBS)),)
+ifneq ($(strip $(BREW_PREFIX)),)
+PA_CFLAGS = -I$(BREW_PREFIX)/include
+PA_LIBS = -L$(BREW_PREFIX)/lib -lportaudio
+else
+PA_LIBS = -lportaudio
+endif
+endif
+
+AMP ?= 1
+
+list-devices: build/tools/list_devices$(EXE)
+	./build/tools/list_devices$(EXE)
+
+build/tools/list_devices$(EXE): tools/list_devices.cpp Makefile
+	@mkdir -p $(@D)
+	$(CXX) -std=c++17 $(PA_CFLAGS) tools/list_devices.cpp $(PA_LIBS) -o $@
+
+live-mic: check-devices build/tools/live_mic$(EXE)
+	./build/tools/live_mic$(EXE) $(AMP) $(IN) $(OUT)
+
+check-devices:
+	@test -n "$(IN)" -a -n "$(OUT)" || { \
+	  echo 'Set input and output device indices, e.g. make live-mic IN=15 OUT=13 AMP=1'; \
+	  echo 'Run make list-devices to look them up (indices shift when devices change).'; \
+	  exit 1; }
+
+build/tools/live_mic$(EXE): tools/live_mic.cpp src/audio/nam_audio.cpp src/audio/nam_audio.h \
+  src/models/amp_models.cpp src/models/amp_models.h src/models/a2_lite.cpp src/models/a2_lite.h \
+  src/audio/nam_processor.cpp src/audio/nam_processor.h $(A2_HEADER) Makefile
+	@test -f $(NAM_DIR)/NAM/dsp.cpp || { echo 'Missing NAM Core; run make install.'; exit 1; }
+	@mkdir -p $(@D)
+	$(CXX) $(HOST_FLAGS) $(HOST_INCLUDES) $(PA_CFLAGS) $(LIVE_MIC_SRC) $(PA_LIBS) -o $@
