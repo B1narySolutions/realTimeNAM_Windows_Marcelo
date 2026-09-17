@@ -2,7 +2,7 @@
 JOBS ?= 4
 include make/models.mk
 
-.PHONY: install build model upload program-dfu monitor format compiledb test live-mic list-devices check-devices clean help
+.PHONY: install build model upload program-dfu monitor format compiledb test live-mic list-devices check-devices render-wav check-files clean help
 install:
 	bash scripts/install.sh
 	@if ls $(A2_MODELS) >/dev/null 2>&1; then \
@@ -60,6 +60,7 @@ help:
 	@echo 'make compiledb Generate compile_commands.json for clangd without building.'
 	@echo 'make list-devices  Build and run the audio device lister to find IN/OUT indices.'
 	@echo 'make live-mic IN=<in> OUT=<out> [AMP=1]  Build and run live mic mode.'
+	@echo 'make render-wav IN=<in.wav> OUT=<out.wav> [AMP=1]  Render a WAV through an amp.'
 	@echo 'make clean    Remove firmware and libDaisy build outputs.'
 
 # Host tools: live mic monitoring through an amp model (needs PortAudio).
@@ -72,8 +73,10 @@ endif
 HOST_FLAGS = -std=c++17 -O2 -DNAM_SAMPLE_FLOAT -DNAM_USE_INLINE_GEMM
 HOST_INCLUDES = -Ibuild/generated -Isrc -I$(NAM_DIR) -I$(NAM_DIR)/NAM \
   -I$(NAM_DIR)/Dependencies/eigen -I$(NAM_DIR)/Dependencies/nlohmann
-LIVE_MIC_SRC = tools/live_mic.cpp src/audio/nam_audio.cpp src/models/amp_models.cpp \
-  src/models/a2_lite.cpp src/audio/nam_processor.cpp $(NAM_DIR)/NAM/dsp.cpp
+NAM_SRC = src/audio/nam_audio.cpp src/models/amp_models.cpp src/models/a2_lite.cpp \
+  src/audio/nam_processor.cpp $(NAM_DIR)/NAM/dsp.cpp
+NAM_HEADERS = src/audio/nam_audio.h src/models/amp_models.h src/models/a2_lite.h \
+  src/audio/nam_processor.h
 
 # PortAudio flags: pkg-config if available, else Homebrew prefix, else plain -lportaudio.
 BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
@@ -106,9 +109,20 @@ check-devices:
 	  echo 'Run make list-devices to look them up (indices shift when devices change).'; \
 	  exit 1; }
 
-build/tools/live_mic$(EXE): tools/live_mic.cpp src/audio/nam_audio.cpp src/audio/nam_audio.h \
-  src/models/amp_models.cpp src/models/amp_models.h src/models/a2_lite.cpp src/models/a2_lite.h \
-  src/audio/nam_processor.cpp src/audio/nam_processor.h $(A2_HEADER) Makefile
+build/tools/live_mic$(EXE): tools/live_mic.cpp $(NAM_SRC) $(NAM_HEADERS) $(A2_HEADER) Makefile
 	@test -f $(NAM_DIR)/NAM/dsp.cpp || { echo 'Missing NAM Core; run make install.'; exit 1; }
 	@mkdir -p $(@D)
-	$(CXX) $(HOST_FLAGS) $(HOST_INCLUDES) $(PA_CFLAGS) $(LIVE_MIC_SRC) $(PA_LIBS) -o $@
+	$(CXX) $(HOST_FLAGS) $(HOST_INCLUDES) $(PA_CFLAGS) tools/live_mic.cpp $(NAM_SRC) $(PA_LIBS) -o $@
+
+render-wav: check-files build/tools/render_wav$(EXE)
+	./build/tools/render_wav$(EXE) $(IN) $(OUT) $(AMP)
+
+check-files:
+	@test -n "$(IN)" -a -n "$(OUT)" || { \
+	  echo 'Set input and output files, e.g. make render-wav IN=solo.wav OUT=fender.wav AMP=1'; \
+	  exit 1; }
+
+build/tools/render_wav$(EXE): tools/render_wav.cpp $(NAM_SRC) $(NAM_HEADERS) $(A2_HEADER) Makefile
+	@test -f $(NAM_DIR)/NAM/dsp.cpp || { echo 'Missing NAM Core; run make install.'; exit 1; }
+	@mkdir -p $(@D)
+	$(CXX) $(HOST_FLAGS) $(HOST_INCLUDES) tools/render_wav.cpp $(NAM_SRC) -o $@
