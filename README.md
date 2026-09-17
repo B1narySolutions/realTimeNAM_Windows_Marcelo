@@ -10,17 +10,18 @@ On macOS, install [Homebrew](https://brew.sh) and Apple's Command Line Tools
 `sudo` access when needed. Run from the repository root:
 
 ```sh
-bash scripts/install.sh
-bash scripts/download_models.sh
+make install
 make
 ```
 
-`make install` runs the same installer. It installs the ARM compiler, DFU uploader,
-and `jq`, then fetches
-pinned versions of libDaisy and NAM Core. The download script saves the three
-Tone3000 models to Git-ignored `models/local/`. The build embeds their weights
-in the firmware. On Ubuntu, the installer also installs the build and download
-prerequisites, including the ARM C/C++ libraries and Python 3.
+`make install` is the whole setup. It installs the ARM compiler, DFU uploader,
+and `jq`, fetches pinned versions of libDaisy and NAM Core, downloads the three
+Tone3000 models to Git-ignored `models/local/`, and converts them to the
+embedded weight data the build links in. Already-downloaded models are left
+alone, so re-running it is cheap. On Ubuntu, the installer also installs the
+build and download prerequisites, including the ARM C/C++ libraries and
+Python 3. The underlying steps are still available on their own:
+`bash scripts/install.sh`, `bash scripts/download_models.sh`, `make model`.
 
 ## Upload and play
 

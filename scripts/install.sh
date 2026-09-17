@@ -75,4 +75,4 @@ git -C "$root/libs/NeuralAmpModelerCore" submodule update --init --recursive
 
 arm-none-eabi-g++ --version
 dfu-util --version
-echo 'Dependencies ready. Run bash scripts/download_models.sh, then make build.'
+echo 'Tools and pinned libraries ready.'
