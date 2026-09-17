@@ -134,11 +134,13 @@ struct InputCallbackData {
     std::vector<float> nam_in_fifo;
     SharedFifo *output_fifo;
     Stats *stats;
+    int channels; // interleaved channels the input stream was opened with
 };
 
 struct OutputCallbackData {
     SharedFifo *output_fifo;
     Stats *stats;
+    int channels; // interleaved channels the output stream was opened with
 };
 
 int InputCallback(const void *input_buffer, void *, unsigned long frame_count,
@@ -155,8 +157,9 @@ int InputCallback(const void *input_buffer, void *, unsigned long frame_count,
         return paContinue;
 
     std::vector<float> mono_in(n);
+    const std::size_t in_channels = static_cast<std::size_t>(data->channels);
     for (std::size_t i = 0; i < n; ++i)
-        mono_in[i] = in[i * 2]; // left channel of interleaved stereo input
+        mono_in[i] = in[i * in_channels]; // first channel of the interleaved input
 
     data->to_48k.Push(mono_in.data(), n);
     std::vector<float> resampled(n * 2 + 8);
@@ -187,9 +190,10 @@ int OutputCallback(const void *, void *output_buffer, unsigned long frame_count,
     std::vector<float> mono_out(n, 0.0f);
     data->output_fifo->Pop(mono_out.data(), n);
 
+    const std::size_t out_channels = static_cast<std::size_t>(data->channels);
     for (std::size_t i = 0; i < n; ++i) {
-        out[i * 2 + 0] = mono_out[i];
-        out[i * 2 + 1] = mono_out[i];
+        for (std::size_t ch = 0; ch < out_channels; ++ch)
+            out[i * out_channels + ch] = mono_out[i]; // same mono signal to every channel
     }
     return paContinue;
 }
@@ -258,27 +262,44 @@ int main(int argc, char **argv) {
         Pa_Terminate();
         return 1;
     }
+    // Open each device with the channel count it actually has, capped at
+    // stereo: a mono-only input (e.g. a built-in laptop mic) rejects a
+    // hardcoded 2-channel request with "Invalid number of channels".
+    const int in_channels = std::min(2, in_info->maxInputChannels);
+    const int out_channels = std::min(2, out_info->maxOutputChannels);
+    if (in_channels < 1) {
+        std::cerr << "Device " << input_device << " (" << in_info->name << ") has no input channels.\n";
+        Pa_Terminate();
+        return 1;
+    }
+    if (out_channels < 1) {
+        std::cerr << "Device " << output_device << " (" << out_info->name << ") has no output channels.\n";
+        Pa_Terminate();
+        return 1;
+    }
     const double in_rate = in_info->defaultSampleRate;
     const double out_rate = out_info->defaultSampleRate;
-    std::cout << "Input:  [" << input_device << "] " << in_info->name << " (" << in_rate << " Hz)\n";
-    std::cout << "Output: [" << output_device << "] " << out_info->name << " (" << out_rate << " Hz)\n";
+    std::cout << "Input:  [" << input_device << "] " << in_info->name << " (" << in_rate << " Hz, "
+              << in_channels << " ch)\n";
+    std::cout << "Output: [" << output_device << "] " << out_info->name << " (" << out_rate << " Hz, "
+              << out_channels << " ch)\n";
     std::cout << "NAM model runs at " << NamAudio::kSampleRate << " Hz; resampling input as needed.\n";
 
     Stats stats;
     SharedFifo output_fifo;
-    InputCallbackData in_data{&audio, LinearResampler(in_rate, static_cast<double>(NamAudio::kSampleRate)), {}, &output_fifo, &stats};
-    OutputCallbackData out_data{&output_fifo, &stats};
+    InputCallbackData in_data{&audio, LinearResampler(in_rate, static_cast<double>(NamAudio::kSampleRate)), {}, &output_fifo, &stats, in_channels};
+    OutputCallbackData out_data{&output_fifo, &stats, out_channels};
 
     PaStreamParameters input_params{};
     input_params.device = input_device;
-    input_params.channelCount = 2;
+    input_params.channelCount = in_channels;
     input_params.sampleFormat = paFloat32;
     input_params.suggestedLatency = in_info->defaultLowInputLatency;
     input_params.hostApiSpecificStreamInfo = nullptr;
 
     PaStreamParameters output_params{};
     output_params.device = output_device;
-    output_params.channelCount = 2;
+    output_params.channelCount = out_channels;
     output_params.sampleFormat = paFloat32;
     output_params.suggestedLatency = out_info->defaultLowOutputLatency;
     output_params.hostApiSpecificStreamInfo = nullptr;
